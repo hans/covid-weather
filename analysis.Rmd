@@ -1,0 +1,238 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(tidyverse)
+library(countyweather)
+```
+
+```{r}
+raw_data <- read_csv("data/covid_confirmed_usafacts.csv", trim_ws=T,
+                    col_types=cols(countyFIPS=col_factor(),
+                                   "County Name"=col_character(),
+                                   State=col_factor(),
+                                   stateFIPS=col_factor()))
+```
+
+## Data
+
+Load climate station metadata
+
+```{r}
+mshr <- read_fwf("data/mshr_enhanced_202003.txt",
+         fwf_cols(source_id=21,
+                  source=11,
+                  begin_date=9,
+                  end_date=9,
+                  station_status=21,
+                  
+                  #ncdcstn_id=20, icao_id=20, wban_id=20, faa_id=20, nwsli_id=20, wmo_id=20, coop_id=20, transmittal_id=20,
+                  skip=21*8,
+                  ghcnd_id=21,
+                  
+                  name=101,
+                  #name_principal_short=31, name_coop=101, name_coop_short=31, name_publication=101, name_alias=101,
+                  skip2=31+101+31+101+101,
+                  
+                  #nws_clim_div=10, nws_clim_div_name=40, 
+                  skip3=11+41,
+                  
+                  state_prov=11, county=51, nws_st_code=3, fips_country_code=3, fips_country_name=101,
+                  
+                  #nws_region=31, nws_wfo=11, 
+                  skip7=31+11,
+                  
+                  #elev_ground=40, elev_ground_unit=20, elev_barom=40, elev_barom_unit=20, elev_air=40, elev_air_unit=20, elev_zerodat=40, elev_zerodat_unit=20, elev_unk=40, elev_unk_unit=20, 
+                  skip4=(41+21)*5,
+                  
+                  #lat_dec=21, lon_dec=21, lat_lon_precision=11,
+                  skip5=21+21+11,
+                  
+                  #relocation=63, utc_offset=17, obs_env=41, platform=101, ghcnmlt_id=21,
+                  skip6=63+17+41+101+21,
+                  
+                  county_fips_code=6),
+         col_types=list(station_status=col_factor(),
+                        ghcnd_id=col_character(),
+                        name=col_character(),
+                        state_prov=col_factor(),
+                        county=col_character(),
+                        fips_country_code=col_factor(),
+                        begin_date=col_date("%Y%m%d"),
+                        end_date=col_date("%Y%m%d"),
+                        county_fips_code=col_factor(),
+                        .default=col_skip())) %>%
+  filter(!is.na(county_fips_code), is.na(station_status) | station_status != "CLOSED") %>% 
+  select(-station_status)
+
+write_csv(mshr, "mshr.csv")
+```
+
+Load weather data
+
+```{r}
+psd <- read_csv("data/ghcnd-pds_2020.csv",
+                col_names=c("ghcnd_id", "date", "element", "value", "mflag", "qflag", "sflag", "obs_time"),
+                col_types=cols(ghcnd_id=col_character(), date=col_date(format="%Y%m%d"), element=col_factor(), value=col_double(),
+                               .default=col_skip()),
+                progress=T)
+psd
+```
+
+Assign county IDs to PSD data; compute means over counties
+
+```{r}
+psd <- psd %>% left_join(mshr[, c("ghcnd_id", "county_fips_code")]) %>% 
+  group_by(county_fips_code, date, element) %>%
+    summarise(value=mean(value, na.rm = TRUE))
+```
+
+
+## Preprocess
+
+```{r}
+data = raw_data %>% 
+  # Pivot to long
+  pivot_longer(cols=contains("/"), names_to="date", values_to="cases") %>% 
+  # Date parsing
+  mutate(date=parse_date(date, format="%m/%d/%y")) %>% 
+  arrange(stateFIPS, countyFIPS, date) %>%
+
+  # Compute cumulative cases
+  group_by(countyFIPS) %>% 
+    arrange(date) %>% mutate(cum_cases.county=cumsum(cases)) %>% 
+  ungroup() %>% 
+  group_by(stateFIPS) %>% 
+    arrange(date) %>% mutate(cum_cases.state=cumsum(cases)) %>% 
+  ungroup() %>% 
+  
+  # Find first day with 5 cumulative cases
+  group_by(countyFIPS) %>%
+    group_modify(~ {
+      mutate(., first_day_cum5.county=pull(.[which(.$cum_cases.county >= 5)[1],], "date"))
+    }) %>% 
+  ungroup() %>% 
+  group_by(stateFIPS) %>%
+    group_modify(~ {
+      mutate(., first_day_cum5.state=pull(.[which(.$cum_cases.state >= 5)[1],], "date"))
+    }) %>%
+  ungroup()
+```
+
+### Join weather  data
+
+```{r}
+# For a given GHCND ID, get tmax/tmin data for the given range.
+load_ghcnd_data = function(ghcnd_id, date_min, date_max) {
+  empty_ghcnd_data = expand.grid(id=ghcnd_id, date=seq(date_min, date_max + 1, "days"),
+                                 name=c("tmax", "tmin"), value=c(NA), stringsAsFactors=F)
+  if (is.na(ghcnd_id) | length(ghcnd_id) == 0) {
+    # TODO
+    logerror("Bad ID")
+    return(empty_ghcnd_data)
+  }
+  ghcnd_path = paste("data", "ghcnd_gsn", paste(ghcnd_id, ".dly", sep=""), sep="/")
+  if (!file.exists(ghcnd_path)) {
+    logerror(paste("Missing GHCND file", ghcnd_id))
+    return(empty_ghcnd_data)
+  }
+  
+  ghcnd_cols = c("id","year","month","element",
+                 do.call("c", lapply(1:31, function(x) paste0(c("VALUE","MFLAG","QFLAG","SFLAG"), x))))
+  ghcnd_col_widths = c(11, 4, 2, 4, rep(c(5, 1, 1, 1), 31))
+  df = read_fwf(ghcnd_path, fwf_widths(ghcnd_col_widths, col_names=ghcnd_cols),
+                col_types=paste0(rep("c", length(ghcnd_cols)), collapse=""), na=c("-9999")) %>%
+    filter(year >= lubridate::year(date_min), element %in% c("TMAX", "TMIN"))
+  
+  # Get an array of dfs, one per variable
+  var_dfs = lapply(as.character(unique(df$element)), function(y){
+      ydat <- df[ df$element == y, ]
+  
+      dd <- ydat %>%
+        select(-contains("FLAG")) %>%
+        gather(var, value, -id, -year, -month, -element) %>%
+        mutate(
+          day = str_extract(var, "[0-9]+"),
+          date = as.Date(sprintf("%s-%s-%s", year, month, day), "%Y-%m-%d")) %>%
+        filter(!is.na(date)) %>%
+        select(-element, -var, -year, -month, -day) %>% 
+        mutate(date=as.Date(date),
+               value=as.numeric(value) / 10) %>%
+        arrange(date)
+      
+      dd <- stats::setNames(dd, c("id", tolower(y), "date"))
+  })
+  
+  # Pivot each df long and concatenate
+  pivot_var_df = function(df) {
+    return(df %>% pivot_longer(c(-id, -date)))
+  }
+  do.call(rbind.data.frame, lapply(var_dfs, pivot_var_df))
+}
+
+#load_daily_averages = function(county_fips, date_min, date_max)
+
+# For a given countyFIPS, get daily weather data.
+keep_vars = c("TMAX", "TMIN", "PRCP")
+join_weather = function(group, key) {
+  date_min = min(group$date)
+  date_max = max(group$date)
+  
+  # Get relevant stations by GHCND ID
+  stations = (mshr %>% 
+    filter(county_fips_code %in% key$countyFIPS,
+           begin_date <= date_max, end_date >= date_min))
+  
+  loginfo(paste("County", unique(group$'County Name'), "has", nrow(stations), "stations"))
+  
+  # Load station data
+  if (nrow(stations) > 0) {
+    ghcnd_data = stations %>% 
+      left_join(psd, by="ghcnd_id") %>%
+      group_by(element, date) %>%
+        filter(element %in% keep_vars) %>%
+        summarise(value=mean(value, na.rm=TRUE)) %>% 
+      pivot_wider(names_from=element, values_from=value)
+    
+    ret = (group %>% left_join(ghcnd_data, by=c("date")))
+    return (ret)
+  }
+  return(group)
+}
+
+data %>% arrange(`County Name`) %>% slice(1:250) %>% group_by(countyFIPS) %>% group_modify(join_weather)
+```
+
+
+```{r}
+data_joined <- data %>% group_by(countyFIPS) %>% group_modify(join_weather)
+write_csv(data_joined, "data_joined.csv")
+
+data_joined %>% filter(!is.na(tmax)) %>% group_by(State) %>% summarise(n())
+```
+
+
+### Fetch and join weather data
+
+```{r}
+join_weather = function(group, key) {
+  weather = county_ave_temps(key$countyFIPS, min(group$date), max(group$date))
+  return(group %>% left_join(weather, by=c("date")))
+}
+
+data_with_weather = data %>% group_by(countyFIPS) %>% group_modify(join_weather)
+write_csv(data_with_weather, "data_with_weather.csv")
+```
+
+
+```{r}
+data %>% ggplot(aes(x=first_day_cum5.county)) + geom_histogram()
+```
+
+
+```{r}
+data %>% ggplot(aes(x=date, y=cum_cases.county, color=State)) + geom_smooth()# , color=State)) + geom_smooth()
+```
+
