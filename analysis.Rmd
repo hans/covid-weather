@@ -141,6 +141,8 @@ data %>% ggplot(aes(x=date, y=cum_cases.county, color=State)) + geom_smooth()# ,
 ```
 
 ```{r}
-data_joined %>% ggplot(aes(x=TMAX, y=cases)) + geom_point()
+data_joined %>% mutate(TMAX1=lag(TMAX, 1), TMAX2=lag(TMAX, 2), TMAX3=lag(TMAX, 3), TMAX4=lag(TMAX, 4), TMAX5=lag(TMAX, 5)) %>% 
+  pivot_longer(cols=starts_with("TMAX")) %>%
+  ggplot(aes(x=value, y=cases)) + geom_point() + facet_grid(~name)
 ```
 
