@@ -70,23 +70,22 @@ mshr <- read_fwf("data/mshr_enhanced_202003.txt",
 write_csv(mshr, "mshr.csv")
 ```
 
-Load weather data
+Load weather data; assign county IDs; compute means over counties.
 
 ```{r}
 psd <- read_csv("data/ghcnd-pds_2020.csv",
                 col_names=c("ghcnd_id", "date", "element", "value", "mflag", "qflag", "sflag", "obs_time"),
                 col_types=cols(ghcnd_id=col_character(), date=col_date(format="%Y%m%d"), element=col_factor(), value=col_double(),
                                .default=col_skip()),
-                progress=T)
-psd
-```
-
-Assign county IDs to PSD data; compute means over counties
-
-```{r}
-psd <- psd %>% left_join(mshr[, c("ghcnd_id", "county_fips_code")]) %>% 
+                progress=T) %>% 
+  left_join(mshr[, c("ghcnd_id", "county_fips_code")]) %>% 
   group_by(county_fips_code, date, element) %>%
     summarise(value=mean(value, na.rm = TRUE))
+
+psd <- psd[,] %>% pivot_wider(names_from=element, values_from=value) %>%
+  select(county_fips_code, date, PRCP, TMIN, TMAX)
+write_csv(psd, "pds.csv")
+psd
 ```
 
 
@@ -124,107 +123,12 @@ data = raw_data %>%
 ### Join weather  data
 
 ```{r}
-# For a given GHCND ID, get tmax/tmin data for the given range.
-load_ghcnd_data = function(ghcnd_id, date_min, date_max) {
-  empty_ghcnd_data = expand.grid(id=ghcnd_id, date=seq(date_min, date_max + 1, "days"),
-                                 name=c("tmax", "tmin"), value=c(NA), stringsAsFactors=F)
-  if (is.na(ghcnd_id) | length(ghcnd_id) == 0) {
-    # TODO
-    logerror("Bad ID")
-    return(empty_ghcnd_data)
-  }
-  ghcnd_path = paste("data", "ghcnd_gsn", paste(ghcnd_id, ".dly", sep=""), sep="/")
-  if (!file.exists(ghcnd_path)) {
-    logerror(paste("Missing GHCND file", ghcnd_id))
-    return(empty_ghcnd_data)
-  }
-  
-  ghcnd_cols = c("id","year","month","element",
-                 do.call("c", lapply(1:31, function(x) paste0(c("VALUE","MFLAG","QFLAG","SFLAG"), x))))
-  ghcnd_col_widths = c(11, 4, 2, 4, rep(c(5, 1, 1, 1), 31))
-  df = read_fwf(ghcnd_path, fwf_widths(ghcnd_col_widths, col_names=ghcnd_cols),
-                col_types=paste0(rep("c", length(ghcnd_cols)), collapse=""), na=c("-9999")) %>%
-    filter(year >= lubridate::year(date_min), element %in% c("TMAX", "TMIN"))
-  
-  # Get an array of dfs, one per variable
-  var_dfs = lapply(as.character(unique(df$element)), function(y){
-      ydat <- df[ df$element == y, ]
-  
-      dd <- ydat %>%
-        select(-contains("FLAG")) %>%
-        gather(var, value, -id, -year, -month, -element) %>%
-        mutate(
-          day = str_extract(var, "[0-9]+"),
-          date = as.Date(sprintf("%s-%s-%s", year, month, day), "%Y-%m-%d")) %>%
-        filter(!is.na(date)) %>%
-        select(-element, -var, -year, -month, -day) %>% 
-        mutate(date=as.Date(date),
-               value=as.numeric(value) / 10) %>%
-        arrange(date)
-      
-      dd <- stats::setNames(dd, c("id", tolower(y), "date"))
-  })
-  
-  # Pivot each df long and concatenate
-  pivot_var_df = function(df) {
-    return(df %>% pivot_longer(c(-id, -date)))
-  }
-  do.call(rbind.data.frame, lapply(var_dfs, pivot_var_df))
-}
-
-#load_daily_averages = function(county_fips, date_min, date_max)
-
-# For a given countyFIPS, get daily weather data.
-keep_vars = c("TMAX", "TMIN", "PRCP")
-join_weather = function(group, key) {
-  date_min = min(group$date)
-  date_max = max(group$date)
-  
-  # Get relevant stations by GHCND ID
-  stations = (mshr %>% 
-    filter(county_fips_code %in% key$countyFIPS,
-           begin_date <= date_max, end_date >= date_min))
-  
-  loginfo(paste("County", unique(group$'County Name'), "has", nrow(stations), "stations"))
-  
-  # Load station data
-  if (nrow(stations) > 0) {
-    ghcnd_data = stations %>% 
-      left_join(psd, by="ghcnd_id") %>%
-      group_by(element, date) %>%
-        filter(element %in% keep_vars) %>%
-        summarise(value=mean(value, na.rm=TRUE)) %>% 
-      pivot_wider(names_from=element, values_from=value)
-    
-    ret = (group %>% left_join(ghcnd_data, by=c("date")))
-    return (ret)
-  }
-  return(group)
-}
-
-data %>% arrange(`County Name`) %>% slice(1:250) %>% group_by(countyFIPS) %>% group_modify(join_weather)
-```
-
-
-```{r}
-data_joined <- data %>% group_by(countyFIPS) %>% group_modify(join_weather)
+data_joined <- data %>% left_join(psd, by=c("countyFIPS" = "county_fips_code", "date"))
 write_csv(data_joined, "data_joined.csv")
-
-data_joined %>% filter(!is.na(tmax)) %>% group_by(State) %>% summarise(n())
 ```
 
 
 ### Fetch and join weather data
-
-```{r}
-join_weather = function(group, key) {
-  weather = county_ave_temps(key$countyFIPS, min(group$date), max(group$date))
-  return(group %>% left_join(weather, by=c("date")))
-}
-
-data_with_weather = data %>% group_by(countyFIPS) %>% group_modify(join_weather)
-write_csv(data_with_weather, "data_with_weather.csv")
-```
 
 
 ```{r}
@@ -234,5 +138,9 @@ data %>% ggplot(aes(x=first_day_cum5.county)) + geom_histogram()
 
 ```{r}
 data %>% ggplot(aes(x=date, y=cum_cases.county, color=State)) + geom_smooth()# , color=State)) + geom_smooth()
+```
+
+```{r}
+data_joined %>% ggplot(aes(x=TMAX, y=cases)) + geom_point()
 ```
 
