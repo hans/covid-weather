@@ -125,6 +125,7 @@ data = raw_data %>%
 ```{r}
 data_joined <- data %>% left_join(psd, by=c("countyFIPS" = "county_fips_code", "date"))
 write_csv(data_joined, "data_joined.csv")
+data_joined <- read_csv("data_joined.csv", col_types=cols(PRCP=col_double(), TMAX=col_double(), TMIN=col_double()))
 ```
 
 
@@ -132,17 +133,125 @@ write_csv(data_joined, "data_joined.csv")
 
 
 ```{r}
-data %>% ggplot(aes(x=first_day_cum5.county)) + geom_histogram()
+data_joined %>% ggplot(aes(x=first_day_cum5.county)) + geom_histogram()
 ```
 
 
 ```{r}
-data %>% ggplot(aes(x=date, y=cum_cases.county, color=State)) + geom_smooth()# , color=State)) + geom_smooth()
+data_joined %>% ggplot(aes(x=date, y=cum_cases.county, color=State)) + geom_smooth()# , color=State)) + geom_smooth()
 ```
 
 ```{r}
-data_joined %>% mutate(TMAX1=lag(TMAX, 1), TMAX2=lag(TMAX, 2), TMAX3=lag(TMAX, 3), TMAX4=lag(TMAX, 4), TMAX5=lag(TMAX, 5)) %>% 
-  pivot_longer(cols=starts_with("TMAX")) %>%
+data_joined %>% ggplot(aes(x=date, y=TMIN, color=State)) + geom_smooth()
+```
+
+```{r}
+data_joined %>% ggplot(aes(x=TMAX, y=cases)) + geom_point()
+```
+
+The second group on the right are Florida and Louisiana, states exceptionally hard-hit by the pandemic:
+```{r}
+data_joined %>% filter(!(State %in% c("FL", "LA"))) %>% ggplot(aes(x=TMAX, y=cases, color=State)) + geom_point()
+```
+
+```{r}
+data_joined %>% 
+  group_by(countyFIPS) %>% 
+    mutate(tmax_z=(TMAX-mean(TMAX, na.rm=TRUE))/sd(TMAX, na.rm=TRUE)) %>% 
+  ungroup() %>%
+  ggplot(aes(x=tmax_z, y=cases, color=State)) + geom_point()
+```
+
+```{r}
+data_joined = data_joined %>% 
+  group_by(countyFIPS) %>% 
+    mutate(tmax_z=(TMAX-mean(TMAX, na.rm=TRUE))/sd(TMAX, na.rm=TRUE)) %>% 
+  ungroup() %>%
+  mutate(tmax_1=lag(TMAX, 1), tmax_2=lag(TMAX, 2), tmax_3=lag(TMAX, 3), tmax_4=lag(TMAX, 4), tmax_5=lag(TMAX, 5),
+         tmax_z1=lag(tmax_z, 1), tmax_z2=lag(tmax_z, 2), tmax_z3=lag(tmax_z, 3), tmax_z4=lag(tmax_z, 4), tmax_z5=lag(tmax_z, 5))
+
+data_joined %>%
+  pivot_longer(cols=starts_with("tmax_z")) %>%
   ggplot(aes(x=value, y=cases)) + geom_point() + facet_grid(~name)
+```
+
+```{r}
+library(lme4)
+
+data_lm <- data_joined %>% 
+  mutate(days_since_first5=date - first_day_cum5.county) %>% 
+  filter(days_since_first5 >= 0)
+
+lm <- lmer(cases ~ tmax_4 + tmax_5 + days_since_first5 + (1 | State/countyFIPS), data=data_lm)
+summary(lm)
+
+data_lm %>% ggplot(aes(x=days_since_first5, y=log(cases), color=State)) + geom_point()
+```
+```{r}
+# Load county population data
+population <- read_csv("data/cc-est2018-alldata.csv")
+# TODO some data loss here because county fips codes don't match up -- they're 3 digits in census data, but 5 in NCDC
+population <- population %>% filter(YEAR == 11, AGEGRP == 0) %>% transmute(State=as.double(STATE), "County Name"=CTYNAME, population=TOT_POP)
+data_joined <- data_joined %>% left_join(population, by=c("stateFIPS" = "State", "County Name"))
+```
+
+```{r}
+library(deSolve)
+## Create an SIR function
+sir <- function(time, state, parameters) {
+
+  with(as.list(c(state, parameters)), {
+
+    dS <- -beta * S * I
+    dI <-  beta * S * I - gamma * I
+    dR <-                 gamma * I
+
+    return(list(c(dS, dI, dR)))
+  })
+}
+
+### Set parameters
+## beta: infection parameter; gamma: recovery parameter
+R0 = 2.25
+GAMMA = 1 / 9
+## Time frame
+times      <- seq(0, 160, by = 1)
+
+# Calculate expected infections based on SIR curve for a county df, and add to county df.
+compute_sir <- function(R0, county_df, key) {
+  first_day_cum5 = unique(county_df$first_day_cum5.county)
+  N = unique(county_df$population)
+  I = 5 / N
+  S = (N - I) / N
+  
+  print(c(N, max(county_df$cum_cases.county)))
+  init <- c(S = S, I = I, R = 0.0)
+  params <- c(beta=R0 * GAMMA, gamma=GAMMA)
+  sir_result = data.frame(ode(y=init, times=times, func=sir, parms=params)) %>% 
+    transmute(date=time + first_day_cum5,
+              sir_cum_cases=round(I * N + R * N))
+  
+  return(sir_result)
+}
+
+R0_options = c(1.4, 1.5, 2.25)
+add_sirs <- function(county_df, key) {
+  for (r0 in R0_options) {
+    sir_result = compute_sir(r0, county_df, key)
+    names(sir_result) = paste(names(sir_result), r0, sep=".")
+    county_df = county_df %>% left_join(sir_result, by=c("date" = paste("date", r0, sep=".")))
+  }
+  
+  return(county_df)
+}
+
+# Compute SIR statistics
+test_counties = sample(data_joined$countyFIPS, 50)
+data_joined %>% filter(countyFIPS %in% test_counties) %>% 
+  group_by(countyFIPS) %>% group_modify(add_sirs) %>% 
+  ggplot(aes(x=cum_cases.county, color=as.factor(countyFIPS))) +
+  geom_point(aes(y=sir_cum_cases.1.5))
+#data_joined %>% filter(countyFIPS==48457) %>% group_by(countyFIPS) %>% group_modify(add_sir) %>%
+#  ggplot(aes(x=cum_cases.county, y=sir_cum_cases)) + geom_point()
 ```
 
