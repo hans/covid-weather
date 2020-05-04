@@ -5,15 +5,14 @@ output: html_notebook
 
 ```{r}
 library(tidyverse)
-library(countyweather)
 ```
 
 ```{r}
-raw_data <- read_csv("data/covid_confirmed_usafacts.csv", trim_ws=T,
-                    col_types=cols(countyFIPS=col_factor(),
-                                   "County Name"=col_character(),
-                                   State=col_factor(),
-                                   stateFIPS=col_factor()))
+covid_data <- read_csv("data/covid_confirmed_usafacts.csv", trim_ws=T,
+                       col_types=cols(countyFIPS=col_factor(),
+                                      "County Name"=col_character(),
+                                      State=col_factor(),
+                                      stateFIPS=col_factor()))
 ```
 
 ## Data
@@ -73,7 +72,7 @@ write_csv(mshr, "mshr.csv")
 Load weather data; assign county IDs; compute means over counties.
 
 ```{r}
-psd <- read_csv("data/ghcnd-pds_2020.csv",
+pds <- read_csv("data/ghcnd-pds_2020.csv",
                 col_names=c("ghcnd_id", "date", "element", "value", "mflag", "qflag", "sflag", "obs_time"),
                 col_types=cols(ghcnd_id=col_character(), date=col_date(format="%Y%m%d"), element=col_factor(), value=col_double(),
                                .default=col_skip()),
@@ -82,17 +81,17 @@ psd <- read_csv("data/ghcnd-pds_2020.csv",
   group_by(county_fips_code, date, element) %>%
     summarise(value=mean(value, na.rm = TRUE))
 
-psd <- psd[,] %>% pivot_wider(names_from=element, values_from=value) %>%
+pds <- pds[,] %>% pivot_wider(names_from=element, values_from=value) %>%
   select(county_fips_code, date, PRCP, TMIN, TMAX)
-write_csv(psd, "pds.csv")
-psd
+write_csv(pds, "pds.csv")
+pds
 ```
 
 
 ## Preprocess
 
 ```{r}
-data = raw_data %>% 
+covid_data = covid_data %>% 
   # Pivot to long
   pivot_longer(cols=contains("/"), names_to="date", values_to="cases") %>% 
   # Date parsing
