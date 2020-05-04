@@ -246,12 +246,14 @@ add_sirs <- function(county_df, key) {
 }
 
 # Compute SIR statistics
-test_counties = sample(data_joined$countyFIPS, 50)
+test_counties = sample(data_joined$countyFIPS, 500)
 data_joined %>% filter(countyFIPS %in% test_counties) %>% 
   group_by(countyFIPS) %>% group_modify(add_sirs) %>% 
-  ggplot(aes(x=cum_cases.county, color=as.factor(countyFIPS))) +
+  ggplot(aes(x=cum_cases.county, color=countyFIPS)) +
   geom_point(aes(y=sir_cum_cases.1.5))
 #data_joined %>% filter(countyFIPS==48457) %>% group_by(countyFIPS) %>% group_modify(add_sir) %>%
 #  ggplot(aes(x=cum_cases.county, y=sir_cum_cases)) + geom_point()
+
+data_joined %>% ggplot(aes(x=date, y=sir_cum_cases.2.25)) + geom_line()
 ```
 
